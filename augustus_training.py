@@ -230,7 +230,7 @@ class GFF3Parser:
     """Parse GFF3 files to extract gene models"""
 
     @staticmethod
-    def parse(gff3_path: Path, include_all_isoforms: bool = False) -> List[GeneModel]:
+    def parse(gff3_path: Path, include_all_isoforms: bool = True) -> List[GeneModel]:
         """Parse GFF3 file and return list of gene models.
 
         Args:
@@ -499,7 +499,7 @@ class AugustusTrainer:
         optimize_method: int = 3,
         stop_after_first: bool = False,
         start_codons: str = 'ATG',
-        include_all_isoforms: bool = False
+        include_all_isoforms: bool = True
     ):
         self.gff3_file = Path(gff3_file).resolve()
         self.genome_file = Path(genome_file).resolve()
@@ -1472,10 +1472,10 @@ Examples:
     parser.add_argument('--start-codons', default='ATG',
                         help='Comma-separated list of allowed start codons (e.g., "ATG,CTG,TTG"). '
                              'Probabilities will be distributed uniformly. (default: ATG)')
-    parser.add_argument('--include-all-isoforms', action='store_true',
-                        help='Include all alternative splice isoforms as separate gene models '
-                             '(instead of using only the longest isoform per gene). '
-                             'This increases training data diversity but may improve predictions. (default: use longest only)')
+    parser.add_argument('--no-isoforms', action='store_true', dest='no_isoforms',
+                        help='Use only the longest isoform per gene (default: include all isoforms). '
+                             'By default, all alternative splice isoforms are included as separate models '
+                             'to increase training data diversity and improve predictions on organisms with complex splicing.')
 
     args = parser.parse_args()
     
@@ -1507,7 +1507,7 @@ Examples:
         optimize_method=args.optimize_method,
         stop_after_first=args.stop_after_first,
         start_codons=args.start_codons,
-        include_all_isoforms=args.include_all_isoforms
+        include_all_isoforms=not args.no_isoforms
     )
     
     try:
