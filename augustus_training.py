@@ -25,6 +25,7 @@ import random
 import logging
 import json
 import hashlib
+import tempfile
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional, Set, Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -789,18 +790,17 @@ class AugustusTrainer:
                 '--stopCodonExcludedFromCDS=false',
                 str(genes_gb)
             ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            
-            with open(etraining_err, 'w') as f:
-                f.write(result.stderr)
-            
-            # Parse bad genes from stderr
+
+            # Redirect stderr directly to file instead of capturing in memory
+            self._run_subprocess_with_file_redirect(cmd, stderr_file=etraining_err)
+
+            # Parse bad genes from stderr file
             bad_genes: Set[str] = set()
-            for line in result.stderr.split('\n'):
-                match = re.search(r'in sequence (\S+):', line)
-                if match:
-                    bad_genes.add(match.group(1))
+            with open(etraining_err) as f:
+                for line in f:
+                    match = re.search(r'in sequence (\S+):', line)
+                    if match:
+                        bad_genes.add(match.group(1))
             
             self.logger.info(f"Found {len(bad_genes)} problematic gene models")
             
@@ -945,13 +945,11 @@ class AugustusTrainer:
         ]
         
         self.logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        with open(etraining_out, 'w') as f:
-            f.write(result.stdout)
-        
-        # Update stop codon frequencies
-        self._update_stop_codon_freqs(result.stdout)
+        # Redirect stdout directly to file instead of capturing in memory
+        self._run_subprocess_with_file_redirect(cmd, stdout_file=etraining_out)
+
+        # Update stop codon frequencies by reading from file
+        self._update_stop_codon_freqs(str(etraining_out))
         
         # Run augustus test
         test_file = self.output_dir / 'genes.gb.test'
@@ -966,13 +964,11 @@ class AugustusTrainer:
         ]
         
         self.logger.info(f"Running accuracy test...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        with open(test_out, 'w') as f:
-            f.write(result.stdout)
-        
-        # Parse accuracy
-        metrics = self._parse_accuracy(result.stdout)
+        # Redirect stdout directly to file instead of capturing in memory
+        self._run_subprocess_with_file_redirect(cmd, stdout_file=test_out)
+
+        # Parse accuracy by reading from file
+        metrics = self._parse_accuracy(str(test_out))
         self.logger.info(f"First training accuracy:\n{metrics}")
         
         # Backup HMM files
@@ -989,10 +985,26 @@ class AugustusTrainer:
         self._mark_ok('step5')
         return metrics
     
-    def _update_stop_codon_freqs(self, etraining_output: str):
-        """Update stop codon frequencies in parameters.cfg"""
+    def _update_stop_codon_freqs(self, output_source: str):
+        """Update stop codon frequencies in parameters.cfg.
+
+        Args:
+            output_source: Either a file path (str starting with /), or output string
+        """
         freqs = {}
-        for line in etraining_output.split('\n'):
+
+        # Read from file if path provided, otherwise treat as string
+        if output_source.startswith('/') or output_source.startswith('.'):
+            try:
+                with open(output_source) as f:
+                    lines = f.readlines()
+            except (IOError, OSError):
+                self.logger.warning(f"Could not read output file: {output_source}")
+                return
+        else:
+            lines = output_source.split('\n')
+
+        for line in lines:
             for codon in ['tag', 'taa', 'tga']:
                 if line.startswith(f'{codon}:'):
                     match = re.search(r'\(([\d.]+)\)', line)
@@ -1014,11 +1026,29 @@ class AugustusTrainer:
             
             self.logger.info(f"Updated stop codon freqs: TAG={freqs['tag']:.4f}, TAA={freqs['taa']:.4f}, TGA={freqs['tga']:.4f}")
     
-    def _parse_accuracy(self, augustus_output: str) -> AccuracyMetrics:
-        """Parse AUGUSTUS output to extract accuracy metrics"""
+    def _parse_accuracy(self, output_source: str) -> AccuracyMetrics:
+        """Parse AUGUSTUS output to extract accuracy metrics.
+
+        Args:
+            output_source: Either a file path (str starting with /), or output string
+
+        Returns:
+            AccuracyMetrics with parsed values
+        """
         metrics = AccuracyMetrics()
-        
-        for line in augustus_output.split('\n'):
+
+        # Read from file if path provided, otherwise treat as string
+        if output_source.startswith('/') or output_source.startswith('.'):
+            try:
+                with open(output_source) as f:
+                    lines = f.readlines()
+            except (IOError, OSError):
+                self.logger.warning(f"Could not read output file: {output_source}")
+                return metrics
+        else:
+            lines = output_source.split('\n')
+
+        for line in lines:
             # nucleotide level |  0.95 |  0.89 |
             nuc_match = re.search(r'nucleotide level[\s|]+([\d.]+)[\s|]+([\d.]+)', line)
             if nuc_match:
@@ -1044,7 +1074,35 @@ class AugustusTrainer:
                     metrics.gene_specificity = tp / pred
         
         return metrics
-    
+
+    def _run_subprocess_with_file_redirect(self, cmd: List[str], stdout_file: Optional[Path] = None,
+                                           stderr_file: Optional[Path] = None) -> subprocess.CompletedProcess:
+        """
+        Run subprocess with stdout/stderr redirected to files instead of captured in memory.
+
+        This avoids memory buffering of large command outputs and writes them directly to disk.
+        Files are only read when needed for parsing specific metrics.
+
+        Args:
+            cmd: Command to run
+            stdout_file: Path to redirect stdout, None to discard
+            stderr_file: Path to redirect stderr, None to discard
+
+        Returns:
+            CompletedProcess with empty stdout/stderr (actual output in files)
+        """
+        stdout_handle = open(stdout_file, 'w') if stdout_file else subprocess.DEVNULL
+        stderr_handle = open(stderr_file, 'w') if stderr_file else subprocess.DEVNULL
+
+        try:
+            result = subprocess.run(cmd, stdout=stdout_handle, stderr=stderr_handle, text=True)
+            return result
+        finally:
+            if stdout_file:
+                stdout_handle.close()
+            if stderr_file:
+                stderr_handle.close()
+
     def step6_optimize_parameters(self):
         """Step 6: Optimize AUGUSTUS parameters"""
         self.logger.info("\n" + "=" * 50)
@@ -1150,11 +1208,10 @@ class AugustusTrainer:
         ]
         
         self.logger.info(f"Running: {' '.join(cmd)}")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        with open(self.output_dir / 'etraining.out2', 'w') as f:
-            f.write(result.stdout)
-        
+        etraining_out2 = self.output_dir / 'etraining.out2'
+        # Redirect stdout directly to file instead of capturing in memory
+        self._run_subprocess_with_file_redirect(cmd, stdout_file=etraining_out2)
+
         # Set start codons based on user input
         self._set_start_codons()
         
@@ -1170,13 +1227,12 @@ class AugustusTrainer:
         ]
         
         self.logger.info("Running accuracy test...")
-        result = subprocess.run(cmd, capture_output=True, text=True)
-        
-        with open(self.output_dir / 'secondtest.out', 'w') as f:
-            f.write(result.stdout)
-        
-        # Parse accuracy
-        metrics = self._parse_accuracy(result.stdout)
+        secondtest_out = self.output_dir / 'secondtest.out'
+        # Redirect stdout directly to file instead of capturing in memory
+        self._run_subprocess_with_file_redirect(cmd, stdout_file=secondtest_out)
+
+        # Parse accuracy by reading from file
+        metrics = self._parse_accuracy(str(secondtest_out))
         self.logger.info(f"Second training accuracy:\n{metrics}")
         
         # Backup HMM files
