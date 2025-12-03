@@ -1,292 +1,130 @@
-# AUGUSTUS Training Pipeline (Python)
+# AUGUSTUS HMM Training Pipeline (Python)
 
-Complete Python reimplementation of GETA's BGM2AT pipeline for AUGUSTUS HMM training.
+A Python reimplementation of the BGM2AT pipeline for training AUGUSTUS Hidden Markov Models (HMMs). This script provides a standalone, efficient, and modern pipeline for generating new species-specific gene prediction models for AUGUSTUS.
 
-## Features
+It is designed to be highly memory-efficient, fast, and easy to use, removing all external Perl dependencies from the original pipeline.
 
-| Feature | Original (Perl) | Python Version |
-|---------|-----------------|----------------|
-| Parameter optimization | Grid search (6 rounds × 28 params × 6 values) | Bayesian optimization (100 trials) |
-| Config file handling | Full directory copy (~2000×) | Symlinks (minimal I/O) |
-| Parallelization | ParaFly (file-based) | ProcessPoolExecutor (memory) |
-| Dependencies | GETA + Perl modules | Python 3.8+ only |
-| Isoform handling | Single longest per gene | All isoforms as separate models (default) |
-| Memory efficiency | Full file loading | Lazy loading + streaming I/O |
-| Speed | 4-6 hours | 30-60 minutes |
+## Key Features
 
-## Recent Optimizations (v2.0)
-
-- **Isoform Support**: Include all alternative splice variants (gene.1, gene.2, ...) for better training diversity
-- **Lazy FASTA Loading**: 54× memory reduction for large genomes
-- **Streaming GenBank I/O**: 100,000× memory reduction for gene conversion
-- **Batch Processing**: 200× fewer concurrent futures
-- **Subprocess Output Buffering**: Direct file redirection instead of memory capture
-
-## Installation
-
-```bash
-# Required
-pip install optuna --break-system-packages
-
-# AUGUSTUS must be installed and in PATH
-# $AUGUSTUS_CONFIG_PATH must be set
-which augustus etraining
-echo $AUGUSTUS_CONFIG_PATH
-```
-
-### Installing AUGUSTUS
-
-Pick one of the following approaches and then set `AUGUSTUS_CONFIG_PATH` to the `config/` directory inside the AUGUSTUS source tree (or `/usr/share/augustus/config` for packaged installs).
-
-#### Ubuntu/Debian package
-```bash
-sudo apt-get update
-sudo apt-get install -y augustus
-export AUGUSTUS_CONFIG_PATH=/usr/share/augustus/config
-```
-
-#### Conda (Bioconda)
-```bash
-conda create -n augustus -c bioconda -c conda-forge augustus
-conda activate augustus
-export AUGUSTUS_CONFIG_PATH=$CONDA_PREFIX/config
-```
-
-#### Build from source
-```bash
-git clone https://github.com/Gaius-Augustus/Augustus.git
-cd Augustus
-make
-export PATH="$PWD/bin:$PATH"
-export AUGUSTUS_CONFIG_PATH="$PWD/config"
-```
-
-## Files
-
-- `augustus_training.py` - Main pipeline (replaces BGM2AT)
-- `optimize_augustus_module.py` - Parameter optimization module (replaces BGM2AT.optimize_augustus)
-
-## Usage
-
-### Basic Usage
-
-```bash
-# Minimal command
-python augustus_training.py genes.gff3 genome.fasta my_species
-
-# Output will be in ./augustus_training_output/
-```
-
-### Full Options
-
-```bash
-python augustus_training.py \
-    --output-dir ./training_results \
-    --cpu 32 \
-    --n-trials 150 \
-    --flanking-length 1000 \
-    --min-intron-len 20 \
-    --use-memory \
-    --start-codons "ATG,CTG,TTG" \
-    --augustus-species-start-from arabidopsis \
-    genes.gff3 genome.fasta my_new_species
-
-# Use only longest isoforms (old behavior)
-python augustus_training.py \
-    --no-isoforms \
-    genes.gff3 genome.fasta my_species
-```
-
-### Parameters
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `--output-dir` | augustus_training_output | Output directory |
-| `--cpu` | 8 | Number of CPUs |
-| `--n-trials` | 100 | Bayesian optimization trials |
-| `--flanking-length` | auto | Flanking sequence length for GenBank |
-| `--min-gene-number` | 500 | Minimum genes for train/test split |
-| `--test-gene-number` | 300 | Number of genes for testing |
-| `--min-intron-len` | 30 | Minimum intron length |
-| `--use-memory` | False | Use /dev/shm for temp files |
-| `--optimize-method` | 1 | 0=none, 1=Bayesian, 2=optimize_augustus.pl, 3=both |
-| `--stop-after-first` | False | Stop after first training |
-| `--start-codons` | ATG | Comma-separated allowed start codons (e.g., "ATG,CTG,TTG") |
-| `--no-isoforms` | False | Use only longest isoform per gene (default: include all isoforms) |
-| `--augustus-config-path` | $AUGUSTUS_CONFIG_PATH | Custom config path |
-| `--augustus-species-start-from` | None | Copy params from existing species |
-| `--onlytrain-gff3` | None | Additional genes for training only |
-
-### Optimization Method Options
-
-```bash
-# No optimization (just training)
-python augustus_training.py --optimize-method 0 genes.gff3 genome.fasta species
-
-# Bayesian optimization only (fastest, recommended)
-python augustus_training.py --optimize-method 1 genes.gff3 genome.fasta species
-
-# AUGUSTUS optimize_augustus.pl only (slower but thorough)
-python augustus_training.py --optimize-method 2 genes.gff3 genome.fasta species
-
-# Both methods (slowest, most thorough)
-python augustus_training.py --optimize-method 3 genes.gff3 genome.fasta species
-```
-
-## Pipeline Steps
-
-1. **Prepare Config** - Set up AUGUSTUS species directory
-2. **Convert GFF3 → GenBank** - No external dependencies needed
-3. **Filter Bad Genes** - Remove problematic gene models via etraining
-4. **Split Train/Test** - Random stratified split
-5. **First Training** - Initial etraining + accuracy test
-6. **Optimize Parameters** - Bayesian optimization (Optuna)
-7. **Second Training** - Final etraining + accuracy test
-8. **Finalize** - Compare and select best model
-
-## Output Files
-
-```
-augustus_training_output/
-├── augustus_training.log      # Complete log
-├── genes.gb                   # Filtered GenBank file
-├── genes.gb.train             # Training set
-├── genes.gb.test              # Test set
-├── firsttest.out              # First accuracy test
-├── secondtest.out             # Second accuracy test
-├── hmm_files_bak01/           # First training backup
-├── hmm_files_bak02/           # Second training backup
-├── hmm_files_bak -> bak0X/    # Link to best
-├── accuracy_of_AUGUSTUS_HMM_Training.txt  # Final report
-└── optimization/              # Optimization results
-    └── optimization_results.txt
-```
-
-## Architecture & Performance Optimizations
-
-### Memory Efficiency
-
-The Python version includes several major optimizations to handle large genomes:
-
-#### 1. Lazy FASTA Loading (54× reduction)
-- Builds index on first scan (fast)
-- Loads sequences only when needed (on-demand)
-- Per-worker caching prevents duplication
-- Benefit: 3GB genome × 9 workers = 27GB → ~500MB typical
-
-#### 2. Streaming GenBank I/O (100,000× reduction)
-- Removed in-memory GenBank dictionary cache
-- Streams results directly to file during conversion
-- Line-by-line filtering without full file load
-- Benefit: 100MB+ accumulation → 0MB buffered
-
-#### 3. ProcessPoolExecutor Batching (200× reduction)
-- Dynamic batch size = max(cpu × 2, 50)
-- Submits jobs in batches instead of all-at-once
-- Limits concurrent Futures in memory
-- Benefit: 10,000 Futures → 50-100 Futures typical
-
-#### 4. Subprocess Output Redirection
-- Direct file redirection instead of capture_output=True
-- Avoids memory buffering of verbose command output
-- Parses output files on-demand
-- Benefit: 100+ MB output per run → 0 MB buffered
-
-### Single vs. Multiple Pass Parsing
-
-The pipeline is designed for single-pass efficiency:
-- GFF3 parsing: One complete read (includes isoforms)
-- FASTA indexing: One complete read (no full load)
-- GenBank conversion: Stream-to-file (no re-reading)
-
-## Standalone Optimizer
-
-You can also use just the optimizer:
-
-```bash
-python optimize_augustus_module.py \
-    --cpu 32 \
-    --n-trials 200 \
-    --use-memory \
-    species_name train.gb
-```
-
-## Speed Comparison
-
-| Scenario | Original BGM2AT | Python Version |
-|----------|-----------------|----------------|
-| 500 genes, 8 CPU | ~4-6 hours | ~30-60 min |
-| 500 genes, 32 CPU | ~2-3 hours | ~15-30 min |
-| 1000 genes, 32 CPU | ~6-8 hours | ~45-90 min |
-
-## Tips
-
-1. **For organisms with complex splicing** (plants, mammals): Keep default `include_all_isoforms=True`
-   - 2-5× more training data from alternative splicing
-   - Better captures splice junction patterns
-
-2. **For simple organisms** (bacteria, some fungi): Use `--no-isoforms`
-   - Faster training with minimal splicing patterns
-   - Cleaner annotations with single isoform per gene
-
-3. **For fungi/small genomes**: Use `--flanking-length 100 --min-intron-len 20`
-
-4. **For speed**: Use `--use-memory --optimize-method 1 --n-trials 50`
-
-5. **For accuracy**: Use `--optimize-method 3 --n-trials 200`
-
-6. **For large genomes** (10GB+): Don't use `--use-memory`, let it use disk
-   - Lazy loading handles large files efficiently
-   - Streaming I/O prevents memory bottlenecks
-
-7. **Checkpointing**: Pipeline creates `.ok` files; restart from where it stopped
+- **High Performance**: Utilizes modern parallelization (`ProcessPoolExecutor`) and efficient I/O to be significantly faster than the original Perl implementation.
+- **Memory Efficient**: Employs lazy-loading for FASTA files and a streaming I/O model, allowing it to process huge genomes (10GB+) with a minimal memory footprint.
+- **Advanced Parameter Optimization**: Integrates Optuna for sophisticated Bayesian optimization of AUGUSTUS metaparameters, leading to better models in fewer iterations than grid search.
+- **Full Isoform Support**: By default, it treats all alternative splice variants (isoforms) from a GFF3 file as unique training examples, enriching the training data and improving prediction accuracy for organisms with complex splicing.
+- **Zero Perl Dependencies**: A pure Python implementation, simplifying installation and environment management.
+- **Robust & Resumable**: Features comprehensive logging and checkpointing, allowing the pipeline to be safely stopped and resumed from the last completed step.
 
 ## Requirements
 
 - Python 3.8+
-- optuna (`pip install optuna`)
-- AUGUSTUS 3.5.0+
-- $AUGUSTUS_CONFIG_PATH set correctly
+- AUGUSTUS (3.5.0+ recommended) must be installed with its scripts (`etraining`, `new_species.pl`, etc.) in your system's `PATH`.
+- The `AUGUSTUS_CONFIG_PATH` environment variable must be set to point to the AUGUSTUS `config` directory.
+- `optuna`: A Python library for optimization.
 
-## Troubleshooting
+## Installation
 
-### "AUGUSTUS_CONFIG_PATH not found"
+1.  **Install AUGUSTUS**:
+    If you don't have AUGUSTUS installed, you can do so via `apt`, `conda`, or from source.
+
+    *   **Conda (Recommended)**:
+        ```bash
+        conda create -n augustus -c bioconda -c conda-forge augustus
+        conda activate augustus
+        # Set the config path for your conda environment
+        export AUGUSTUS_CONFIG_PATH=$CONDA_PREFIX/config
+        ```
+    *   **Build from Source**:
+        ```bash
+        git clone https://github.com/Gaius-Augustus/Augustus.git
+        cd Augustus
+        make
+        # Add augustus to your PATH and set the config path
+        export PATH="$PWD/bin:$PATH"
+        export AUGUSTUS_CONFIG_PATH="$PWD/config"
+        ```
+
+2.  **Install Python Dependencies**:
+    ```bash
+    pip install optuna
+    ```
+    *BioPython is optional but recommended for the most robust GenBank file handling. If not found, a fallback is used.*
+    ```bash
+    pip install biopython
+    ```
+
+## Usage
+
+The script is run from the command line, with the GFF3, genome FASTA, and a new species name as the primary inputs.
+
 ```bash
-export AUGUSTUS_CONFIG_PATH=/path/to/augustus/config
+python augustus_training.py [OPTIONS] <genes.gff3> <genome.fasta> <species_name>
 ```
 
-### "etraining: command not found"
+### Command-Line Options
+
+| Argument | Description | Default |
+| :--- | :--- | :--- |
+| **`gff3`** | **(Required)** GFF3 file with gene models for training. | |
+| **`genome`** | **(Required)** Genome FASTA file. | |
+| **`species`** | **(Required)** AUGUSTUS species name to create/update. | |
+| `-o`, `--output-dir` | Output directory to store all results and logs. | `augustus_training_output` |
+| `--cpu` | Number of CPUs to use for parallel tasks. | `8` |
+| `--augustus-config-path` | Override the `$AUGUSTUS_CONFIG_PATH` environment variable. | `$AUGUSTUS_CONFIG_PATH` |
+| `--augustus-species-start-from`| Create the new species by copying parameters from an existing species (e.g., `arabidopsis`). | `None` |
+| `--onlytrain-gff3` | An additional GFF3 file with genes to be used only for training (not for testing accuracy). | `None` |
+| `--flanking-length` | Length of flanking DNA to include around each gene in the GenBank file. | `auto` |
+| `--min-gene-number` | Minimum number of valid genes required for a proper train/test split. | `500` |
+| `--test-gene-number`| Number of genes to hold out for the test set. | `300` |
+| `--n-trials` | Number of trials for the Bayesian optimization of parameters. | `100` |
+| `--min-intron-len` | Minimum intron length for `etraining`. | `30` |
+| `--start-codons` | A comma-separated list of allowed start codons. Probabilities are distributed uniformly. | `ATG` |
+| `--no-isoforms` | Flag to use only the longest isoform per gene, disabling the default behavior of using all isoforms. | `False` |
+| `--optimize-method` | Optimization strategy: `0`=None, `1`=Bayesian (Optuna), `2`=optimize_augustus.pl, `3`=Both. | `1` |
+| `--use-memory` | If flagged, use `/dev/shm` for temporary files during optimization. Can be faster but requires sufficient RAM. | `False` |
+| `--stop-after-first` | If flagged, the pipeline will stop after the first training round and skip optimization. | `False` |
+
+---
+
+## Examples
+
+#### Basic Run
+Train a new model for `my_species` using all defaults.
 ```bash
-# Make sure AUGUSTUS is in PATH
-export PATH=/path/to/augustus/bin:$PATH
+python augustus_training.py genes.gff3 genome.fasta my_species
 ```
 
-### Memory issues with large genomes
+#### Advanced Run for a Complex Eukaryote
+This example uses 32 cores, starts from *Arabidopsis* parameters, provides extra training genes, defines multiple start codons, and runs 200 optimization trials.
 ```bash
-# Don't use --use-memory, let it use disk
-# Pipeline uses lazy loading for FASTA and streaming I/O for GenBank
-python augustus_training.py genes.gff3 genome.fasta species
+python augustus_training.py \
+    --output-dir ./training_results \
+    --cpu 32 \
+    --n-trials 200 \
+    --augustus-species-start-from arabidopsis \
+    --onlytrain-gff3 extra_genes.gff3 \
+    --start-codons "ATG,CTG,TTG" \
+    genes.gff3 genome.fasta my_new_plant
 ```
 
-### Too many isoforms increasing training time
+#### Run for a Simple Organism (e.g., some fungi)
+This example disables the multi-isoform feature, as it may not be necessary for organisms with simple gene structures.
 ```bash
-# Use only longest isoform per gene
-python augustus_training.py --no-isoforms genes.gff3 genome.fasta species
+python augustus_training.py \
+    --no-isoforms \
+    --min-intron-len 20 \
+    genes.gff3 genome.fasta my_fungus
 ```
 
-### BioPython not installed warning
-```bash
-# Optional: Install BioPython for more robust GenBank handling
-pip install biopython
+## Pipeline Overview
 
-# Pipeline works without it (uses fallback implementation)
-```
+The pipeline automates the following sequence of steps:
 
-## License
+1.  **Prepare Config**: Sets up the AUGUSTUS species directory and copies base parameters if specified.
+2.  **Convert GFF3 to GenBank**: A memory-efficient, parallelized conversion of GFF3 annotations into the GenBank format required by AUGUSTUS.
+3.  **Filter Bad Genes**: Runs a preliminary `etraining` to identify and exclude gene models that would cause errors (e.g., in-frame stop codons).
+4.  **Split Train/Test Sets**: Randomly splits the valid gene models into training and testing sets.
+5.  **First Training**: Runs `etraining` on the training set and evaluates the accuracy of the resulting model against the test set.
+6.  **Optimize Parameters**: Performs parameter optimization using the selected method (default: Bayesian optimization with Optuna).
+7.  **Second Training**: Re-runs `etraining` with the optimized parameters.
+8.  **Finalize**: Compares the accuracy before and after optimization, keeps the better of the two models, and generates a final report.
 
-Same as original GETA (GPL-3.0)
-
-## Credits
-
-- Original BGM2AT: chenlianfu/geta
-- Python rewrite: For Won's lab
+This entire process is resumable. If the script is interrupted, it will pick up from the last successfully completed step upon re-running.
