@@ -642,7 +642,19 @@ class AugustusTrainer:
             ]
             result = subprocess.run(cmd, capture_output=True, text=True)
             if result.returncode != 0:
-                self.logger.warning(f"new_species.pl warning: {result.stderr}")
+                err_msg = f"Failed to create new species '{self.species_name}'\n"
+                err_msg += f"Command: {' '.join(cmd)}\n"
+                err_msg += f"Error: {result.stderr}"
+                self.logger.error(err_msg)
+                raise RuntimeError(
+                    f"new_species.pl failed with return code {result.returncode}. "
+                    f"This is a critical step for the pipeline. "
+                    f"Please check:\n"
+                    f"  1. AUGUSTUS_CONFIG_PATH is correct: {self.config_path}\n"
+                    f"  2. new_species.pl is in PATH\n"
+                    f"  3. You have write permissions in AUGUSTUS config directory\n"
+                    f"  4. Species name '{self.species_name}' is valid"
+                )
             self.logger.info(f"Created new species: {self.species_name}")
         
         # Copy parameters from starting species if specified
@@ -804,12 +816,19 @@ class AugustusTrainer:
         
         try:
             # Create temp species
-            subprocess.run([
+            cmd = [
                 'new_species.pl',
                 f'--species={temp_species}',
                 f'--AUGUSTUS_CONFIG_PATH={self.config_path}',
                 '--ignore'
-            ], capture_output=True)
+            ]
+            result = subprocess.run(cmd, capture_output=True, text=True)
+            if result.returncode != 0:
+                self.logger.error(f"Failed to create temporary species for validation: {result.stderr}")
+                raise RuntimeError(
+                    f"new_species.pl failed to create temporary species '{temp_species}'. "
+                    f"This is required for gene validation in step 3."
+                )
             
             # Run etraining to find bad genes
             genes_gb = self.output_dir / 'genes.raw.gb'
@@ -825,7 +844,14 @@ class AugustusTrainer:
             ]
 
             # Redirect stderr directly to file instead of capturing in memory
-            self._run_subprocess_with_file_redirect(cmd, stderr_file=etraining_err)
+            result = self._run_subprocess_with_file_redirect(cmd, stderr_file=etraining_err)
+            if result.returncode != 0:
+                self.logger.error(f"etraining failed with return code {result.returncode}")
+                raise RuntimeError(
+                    f"etraining validation failed in step 3. "
+                    f"This is required to identify bad gene models. "
+                    f"Check the error file: {etraining_err}"
+                )
 
             # Parse bad genes from stderr file
             bad_genes: Set[str] = set()
@@ -979,7 +1005,14 @@ class AugustusTrainer:
         
         self.logger.info(f"Running: {' '.join(cmd)}")
         # Redirect stdout directly to file instead of capturing in memory
-        self._run_subprocess_with_file_redirect(cmd, stdout_file=etraining_out)
+        result = self._run_subprocess_with_file_redirect(cmd, stdout_file=etraining_out)
+        if result.returncode != 0:
+            self.logger.error(f"etraining failed with return code {result.returncode}")
+            raise RuntimeError(
+                f"etraining training failed in step 5. "
+                f"This is required for the first training round. "
+                f"Check the output file: {etraining_out}"
+            )
 
         # Update stop codon frequencies by reading from file
         self._update_stop_codon_freqs(str(etraining_out))
@@ -998,7 +1031,14 @@ class AugustusTrainer:
         
         self.logger.info(f"Running accuracy test...")
         # Redirect stdout directly to file instead of capturing in memory
-        self._run_subprocess_with_file_redirect(cmd, stdout_file=test_out)
+        result = self._run_subprocess_with_file_redirect(cmd, stdout_file=test_out)
+        if result.returncode != 0:
+            self.logger.error(f"augustus accuracy test failed with return code {result.returncode}")
+            raise RuntimeError(
+                f"augustus accuracy test failed in step 5. "
+                f"This is required to evaluate the first training round. "
+                f"Check the output file: {test_out}"
+            )
 
         # Parse accuracy by reading from file
         metrics = self._parse_accuracy(str(test_out))
@@ -1243,7 +1283,14 @@ class AugustusTrainer:
         self.logger.info(f"Running: {' '.join(cmd)}")
         etraining_out2 = self.output_dir / 'etraining.out2'
         # Redirect stdout directly to file instead of capturing in memory
-        self._run_subprocess_with_file_redirect(cmd, stdout_file=etraining_out2)
+        result = self._run_subprocess_with_file_redirect(cmd, stdout_file=etraining_out2)
+        if result.returncode != 0:
+            self.logger.error(f"etraining failed with return code {result.returncode}")
+            raise RuntimeError(
+                f"etraining training failed in step 7. "
+                f"This is required for the second training round. "
+                f"Check the output file: {etraining_out2}"
+            )
 
         # Set start codons based on user input
         self._set_start_codons()
@@ -1262,7 +1309,14 @@ class AugustusTrainer:
         self.logger.info("Running accuracy test...")
         secondtest_out = self.output_dir / 'secondtest.out'
         # Redirect stdout directly to file instead of capturing in memory
-        self._run_subprocess_with_file_redirect(cmd, stdout_file=secondtest_out)
+        result = self._run_subprocess_with_file_redirect(cmd, stdout_file=secondtest_out)
+        if result.returncode != 0:
+            self.logger.error(f"augustus accuracy test failed with return code {result.returncode}")
+            raise RuntimeError(
+                f"augustus accuracy test failed in step 7. "
+                f"This is required to evaluate the second training round. "
+                f"Check the output file: {secondtest_out}"
+            )
 
         # Parse accuracy by reading from file
         metrics = self._parse_accuracy(str(secondtest_out))
