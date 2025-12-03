@@ -26,7 +26,7 @@ import logging
 import json
 import hashlib
 from pathlib import Path
-from typing import Dict, List, Tuple, Optional, Set
+from typing import Dict, List, Tuple, Optional, Set, Iterator
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
@@ -507,8 +507,9 @@ class AugustusTrainer:
         self.train_genes: List[GeneModel] = []
         self.test_genes: List[GeneModel] = []
         
-        # GenBank content cache
-        self.gb_content: Dict[str, str] = {}  # gene_id -> genbank string
+        # GenBank content cache (minimal - only keep what we need)
+        # Avoid loading all genes into memory at once
+        self.gb_gene_ids: Set[str] = set()  # Track which genes have valid GB files
         
     def setup(self):
         """Initialize the training environment"""
@@ -627,81 +628,120 @@ class AugustusTrainer:
         self._mark_ok('step1')
     
     def step2_convert_to_genbank(self):
-        """Step 2: Convert GFF3 to GenBank format (in parallel)"""
+        """Step 2: Convert GFF3 to GenBank format (in parallel)
+
+        Optimization: Stream results directly to file instead of caching in memory.
+        This avoids loading all genes into self.gb_content.
+        """
         self.logger.info("\n" + "=" * 50)
         self.logger.info("Step 2: Convert GFF3 to GenBank format (in parallel)")
         self.logger.info("=" * 50)
-        
+
         if self._check_ok_file('step2'):
-            self.logger.info("Step 2 already completed, loading existing files...")
-            self._load_genbank_files()
+            self.logger.info("Step 2 already completed, skipping...")
+            self._mark_gene_ids_from_files()
             return
-        
+
         all_genes_to_process = self.genes + self.onlytrain_genes
         total_genes = len(all_genes_to_process)
         self.logger.info(f"Converting {total_genes} total genes to GenBank format using {self.cpu} workers...")
-        
+
+        # Output files
+        genes_gb_path = self.output_dir / 'genes.raw.gb'
+        onlytrain_gb_path = self.output_dir / 'genes.onlytrain.gb'
+
+        # Create mapping of gene_id -> file path for output
+        gene_output_files = {}
+        for gene in self.genes:
+            gene_output_files[gene.gene_id] = genes_gb_path
+        for gene in self.onlytrain_genes:
+            gene_output_files[gene.gene_id] = onlytrain_gb_path
+
         # Use a process pool to parallelize the conversion
+        # Stream results directly to files (no intermediate caching)
         with ProcessPoolExecutor(
             max_workers=self.cpu,
             initializer=_initialize_gb_worker,
             initargs=(self.genome_file, self.flanking_length)
         ) as executor:
-            
-            futures = [executor.submit(_run_gb_conversion, gene) for gene in all_genes_to_process]
-            
-            processed_count = 0
-            for future in as_completed(futures):
-                gene_id, gb_string = future.result()
-                if gb_string:
-                    self.gb_content[gene_id] = gb_string
-                
-                processed_count += 1
-                if processed_count % 100 == 0 or processed_count == total_genes:
-                    self.logger.info(f"Converted {processed_count}/{total_genes} genes...")
 
-        self.logger.info("All genes converted. Writing to output files...")
-        
-        # Write main genes file
-        genes_gb_path = self.output_dir / 'genes.raw.gb'
-        with open(genes_gb_path, 'w') as f:
-            for gene in self.genes:
-                if gene.gene_id in self.gb_content:
-                    f.write(self.gb_content[gene.gene_id])
-        
-        # Write onlytrain genes file if they exist
-        if self.onlytrain_genes:
-            onlytrain_gb_path = self.output_dir / 'genes.onlytrain.gb'
-            with open(onlytrain_gb_path, 'w') as f:
-                for gene in self.onlytrain_genes:
-                    if gene.gene_id in self.gb_content:
-                        f.write(self.gb_content[gene.gene_id])
-        
+            futures = {executor.submit(_run_gb_conversion, gene): gene.gene_id
+                      for gene in all_genes_to_process}
+
+            # Open output files for streaming writes
+            file_handles = {
+                genes_gb_path: open(genes_gb_path, 'w'),
+                onlytrain_gb_path: open(onlytrain_gb_path, 'w')
+            }
+
+            try:
+                processed_count = 0
+                for future in as_completed(futures):
+                    gene_id = futures[future]
+                    try:
+                        _, gb_string = future.result()
+                        if gb_string and gene_id in gene_output_files:
+                            # Stream directly to file (no memory accumulation)
+                            output_file = gene_output_files[gene_id]
+                            file_handles[output_file].write(gb_string)
+                            self.gb_gene_ids.add(gene_id)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to convert gene {gene_id}: {e}")
+
+                    processed_count += 1
+                    if processed_count % 100 == 0 or processed_count == total_genes:
+                        self.logger.info(f"Converted {processed_count}/{total_genes} genes...")
+            finally:
+                # Close output files
+                for f in file_handles.values():
+                    f.close()
+
         self.logger.info("GenBank files written.")
         self._mark_ok('step2')
     
-    def _load_genbank_files(self):
-        """Load existing GenBank files into cache"""
+    def _mark_gene_ids_from_files(self):
+        """Mark which genes have valid GB files (without loading into memory)"""
         genes_gb = self.output_dir / 'genes.raw.gb'
         if genes_gb.exists():
-            self._parse_genbank_to_cache(genes_gb)
-        
+            self._scan_genbank_gene_ids(genes_gb)
+
         onlytrain_gb = self.output_dir / 'genes.onlytrain.gb'
         if onlytrain_gb.exists():
-            self._parse_genbank_to_cache(onlytrain_gb)
-    
-    def _parse_genbank_to_cache(self, gb_file: Path):
-        """Parse GenBank file and cache entries by gene ID"""
+            self._scan_genbank_gene_ids(onlytrain_gb)
+
+    def _scan_genbank_gene_ids(self, gb_file: Path):
+        """Scan GenBank file to find gene IDs without loading entire file into memory"""
         with open(gb_file) as f:
-            content = f.read()
-        
-        for record in content.split('//\n'):
-            if not record.strip():
-                continue
-            match = re.search(r'/gene="([^"]+)"', record)
-            if match:
-                gene_id = match.group(1)
-                self.gb_content[gene_id] = record + '//\n'
+            for line in f:
+                match = re.search(r'/gene="([^"]+)"', line)
+                if match:
+                    self.gb_gene_ids.add(match.group(1))
+
+    def _copy_filtered_genbank(self, in_file, out_file, valid_genes: List[GeneModel]):
+        """Copy GenBank records for valid genes only (streaming, no full file load)
+
+        Reads GenBank file line by line, copies records matching valid gene IDs.
+        """
+        valid_gene_ids = {g.gene_id for g in valid_genes}
+        current_gene_id = None
+        in_record = False
+
+        for line in in_file:
+            # Detect gene ID at start of record
+            if '/gene="' in line:
+                match = re.search(r'/gene="([^"]+)"', line)
+                if match:
+                    current_gene_id = match.group(1)
+                    in_record = current_gene_id in valid_gene_ids
+
+            # Write line if this record is valid
+            if in_record:
+                out_file.write(line)
+
+            # Detect end of record
+            if line.strip() == '//':
+                in_record = False
+                current_gene_id = None
     
     def step3_filter_bad_genes(self):
         """Step 3: Remove incorrect gene models using etraining"""
@@ -762,13 +802,12 @@ class AugustusTrainer:
             # Filter genes
             self.genes = [g for g in self.genes if g.gene_id not in bad_genes]
             self.logger.info(f"Remaining valid genes: {len(self.genes)}")
-            
-            # Write filtered GenBank
+
+            # Write filtered GenBank (copy from source, only valid genes)
             filtered_gb = self.output_dir / 'genes.gb'
-            with open(filtered_gb, 'w') as f:
-                for gene in self.genes:
-                    if gene.gene_id in self.gb_content:
-                        f.write(self.gb_content[gene.gene_id])
+            with open(filtered_gb, 'w') as out_f:
+                with open(genes_gb) as in_f:
+                    self._copy_filtered_genbank(in_f, out_f, self.genes)
             
         finally:
             # Cleanup temp species
@@ -818,16 +857,10 @@ class AugustusTrainer:
         self._write_genbank_list(self.train_genes, self.output_dir / 'genes.gb.train')
         self._write_genbank_list(self.test_genes, self.output_dir / 'genes.gb.test')
         
-        # Write etraining file (train + onlytrain)
-        etraining_genes = self.train_genes.copy()
+        # Write etraining file (train + onlytrain, stream from source files)
+        etraining_genes = self.train_genes + self.onlytrain_genes
         etraining_file = self.output_dir / 'genes.gb.etraining'
-        with open(etraining_file, 'w') as f:
-            for gene in self.train_genes:
-                if gene.gene_id in self.gb_content:
-                    f.write(self.gb_content[gene.gene_id])
-            for gene in self.onlytrain_genes:
-                if gene.gene_id in self.gb_content:
-                    f.write(self.gb_content[gene.gene_id])
+        self._write_genbank_list(etraining_genes, etraining_file)
         
         # Save split info
         split_info = {
@@ -843,11 +876,24 @@ class AugustusTrainer:
         self._mark_ok('step4')
     
     def _write_genbank_list(self, genes: List[GeneModel], output_path: Path):
-        """Write list of genes to GenBank file"""
-        with open(output_path, 'w') as f:
-            for gene in genes:
-                if gene.gene_id in self.gb_content:
-                    f.write(self.gb_content[gene.gene_id])
+        """Write list of genes to GenBank file (stream from source, no memory cache)"""
+        valid_gene_ids = {g.gene_id for g in genes}
+
+        # Source files to read from
+        source_files = []
+        genes_gb = self.output_dir / 'genes.gb'
+        if genes_gb.exists():
+            source_files.append(genes_gb)
+
+        onlytrain_gb = self.output_dir / 'genes.onlytrain.gb'
+        if onlytrain_gb.exists():
+            source_files.append(onlytrain_gb)
+
+        # Stream copy from source files
+        with open(output_path, 'w') as out_f:
+            for source_file in source_files:
+                with open(source_file) as in_f:
+                    self._copy_filtered_genbank(in_f, out_f, genes)
     
     def _load_train_test_split(self):
         """Load existing train/test split"""
