@@ -117,8 +117,8 @@ except ImportError:
 
 
 # Globals for the ProcessPoolExecutor worker
-_worker_fasta_reader: Optional[FastaReader] = None
-_worker_gb_writer: Optional[GenBankWriter] = None
+_worker_fasta_reader: Optional['FastaReader'] = None
+_worker_gb_writer: Optional['GenBankWriter'] = None
 
 
 def _initialize_gb_worker(fasta_path: Path, flanking_length: int):
@@ -152,57 +152,77 @@ def _run_gb_conversion(gene: GeneModel) -> Tuple[str, str]:
 
 
 class FastaReader:
-    """FASTA file reader using BioPython"""
-    
+    """FASTA file reader with lazy loading (memory efficient)
+
+    Builds an index on first read, then loads only requested subsequences.
+    Avoids loading entire genome into memory.
+    """
+
     def __init__(self, fasta_path: Path):
         self.fasta_path = fasta_path
-        self.sequences: Dict[str, SeqRecord] = {}
-        self._load_fasta()
-    
-    def _load_fasta(self):
-        """Load FASTA file using BioPython"""
-        if BIOPYTHON_AVAILABLE:
-            for record in SeqIO.parse(self.fasta_path, "fasta"):
-                self.sequences[record.id] = record
-        else:
-            # Fallback to manual parsing
-            current_id = None
-            current_seq = []
-            with open(self.fasta_path) as f:
-                for line in f:
-                    line = line.strip()
+        self.index: Dict[str, Tuple[int, int]] = {}  # seqid -> (length, header_line_number)
+        self._seq_cache: Dict[str, str] = {}  # Cache for full sequences (per-worker)
+        self._build_index()
+
+    def _build_index(self):
+        """Build index by reading file once, storing seqid and position"""
+        with open(self.fasta_path) as f:
+            for line_num, line in enumerate(f):
+                if line.startswith('>'):
+                    seqid = line[1:].split()[0]
+                    self.index[seqid] = (0, line_num)  # Will be updated when sequence ends
+
+    def _ensure_sequence_loaded(self, seqid: str):
+        """Load sequence into cache if not already loaded"""
+        if seqid in self._seq_cache:
+            return
+
+        if seqid not in self.index:
+            raise KeyError(f"Sequence {seqid} not found in FASTA")
+
+        # Load this specific sequence from file
+        seq_lines = []
+        found = False
+        with open(self.fasta_path) as f:
+            for line in f:
+                if line.startswith(f'>{seqid}'):
+                    found = True
+                    continue
+                if found:
                     if line.startswith('>'):
-                        if current_id:
-                            self.sequences[current_id] = ''.join(current_seq)
-                        current_id = line[1:].split()[0]
-                        current_seq = []
-                    else:
-                        current_seq.append(line)
-                if current_id:
-                    self.sequences[current_id] = ''.join(current_seq)
-    
+                        break
+                    seq_lines.append(line.rstrip('\n\r'))
+
+        if found:
+            self._seq_cache[seqid] = ''.join(seq_lines)
+        else:
+            raise KeyError(f"Sequence {seqid} not found in FASTA")
+
     def get_sequence(self, seqid: str, start: int = None, end: int = None) -> str:
         """Get sequence or subsequence (1-based coordinates)"""
-        if seqid not in self.sequences:
-            raise KeyError(f"Sequence {seqid} not found in FASTA")
-        
-        seq = self.sequences[seqid]
-        if BIOPYTHON_AVAILABLE:
-            seq_str = str(seq.seq)
-        else:
-            seq_str = seq
-            
-        if start is not None and end is not None:
-            return seq_str[start-1:end]
-        return seq_str
-    
+        # Ensure sequence is loaded
+        self._ensure_sequence_loaded(seqid)
+
+        seq = self._seq_cache[seqid]
+        seq_len = len(seq)
+
+        # Handle defaults
+        if start is None:
+            start = 1
+        if end is None:
+            end = seq_len
+
+        # Validate coordinates
+        if start < 1 or end > seq_len or start > end:
+            raise ValueError(f"Invalid coordinates: {start}-{end} for sequence of length {seq_len}")
+
+        # Return substring (convert to 0-based)
+        return seq[start-1:end]
+
     def get_seq_length(self, seqid: str) -> int:
-        """Get sequence length"""
-        if seqid not in self.sequences:
-            raise KeyError(f"Sequence {seqid} not found")
-        if BIOPYTHON_AVAILABLE:
-            return len(self.sequences[seqid].seq)
-        return len(self.sequences[seqid])
+        """Get sequence length (loads sequence if needed)"""
+        self._ensure_sequence_loaded(seqid)
+        return len(self._seq_cache[seqid])
 
 
 class GFF3Parser:
