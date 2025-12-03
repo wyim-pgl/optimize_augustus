@@ -658,43 +658,53 @@ class AugustusTrainer:
             gene_output_files[gene.gene_id] = onlytrain_gb_path
 
         # Use a process pool to parallelize the conversion
-        # Stream results directly to files (no intermediate caching)
-        with ProcessPoolExecutor(
-            max_workers=self.cpu,
-            initializer=_initialize_gb_worker,
-            initargs=(self.genome_file, self.flanking_length)
-        ) as executor:
+        # Process in batches to avoid accumulating all Futures in memory
+        batch_size = max(self.cpu * 2, 50)  # Batches of ~2x worker count
 
-            futures = {executor.submit(_run_gb_conversion, gene): gene.gene_id
-                      for gene in all_genes_to_process}
+        # Open output files for streaming writes
+        file_handles = {
+            genes_gb_path: open(genes_gb_path, 'w'),
+            onlytrain_gb_path: open(onlytrain_gb_path, 'w')
+        }
 
-            # Open output files for streaming writes
-            file_handles = {
-                genes_gb_path: open(genes_gb_path, 'w'),
-                onlytrain_gb_path: open(onlytrain_gb_path, 'w')
-            }
+        try:
+            with ProcessPoolExecutor(
+                max_workers=self.cpu,
+                initializer=_initialize_gb_worker,
+                initargs=(self.genome_file, self.flanking_length)
+            ) as executor:
 
-            try:
                 processed_count = 0
-                for future in as_completed(futures):
-                    gene_id = futures[future]
-                    try:
-                        _, gb_string = future.result()
-                        if gb_string and gene_id in gene_output_files:
-                            # Stream directly to file (no memory accumulation)
-                            output_file = gene_output_files[gene_id]
-                            file_handles[output_file].write(gb_string)
-                            self.gb_gene_ids.add(gene_id)
-                    except Exception as e:
-                        self.logger.warning(f"Failed to convert gene {gene_id}: {e}")
 
-                    processed_count += 1
-                    if processed_count % 100 == 0 or processed_count == total_genes:
-                        self.logger.info(f"Converted {processed_count}/{total_genes} genes...")
-            finally:
-                # Close output files
-                for f in file_handles.values():
-                    f.close()
+                # Process genes in batches to avoid Future accumulation
+                for batch_start in range(0, total_genes, batch_size):
+                    batch_end = min(batch_start + batch_size, total_genes)
+                    batch_genes = all_genes_to_process[batch_start:batch_end]
+
+                    # Submit batch of jobs
+                    futures = {executor.submit(_run_gb_conversion, gene): gene.gene_id
+                              for gene in batch_genes}
+
+                    # Wait for batch to complete before processing next batch
+                    for future in as_completed(futures):
+                        gene_id = futures[future]
+                        try:
+                            _, gb_string = future.result()
+                            if gb_string and gene_id in gene_output_files:
+                                # Stream directly to file (no memory accumulation)
+                                output_file = gene_output_files[gene_id]
+                                file_handles[output_file].write(gb_string)
+                                self.gb_gene_ids.add(gene_id)
+                        except Exception as e:
+                            self.logger.warning(f"Failed to convert gene {gene_id}: {e}")
+
+                        processed_count += 1
+                        if processed_count % 100 == 0 or processed_count == total_genes:
+                            self.logger.info(f"Converted {processed_count}/{total_genes} genes...")
+        finally:
+            # Close output files
+            for f in file_handles.values():
+                f.close()
 
         self.logger.info("GenBank files written.")
         self._mark_ok('step2')
