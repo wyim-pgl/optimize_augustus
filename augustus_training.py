@@ -228,34 +228,43 @@ class FastaReader:
 
 class GFF3Parser:
     """Parse GFF3 files to extract gene models"""
-    
+
     @staticmethod
-    def parse(gff3_path: Path) -> List[GeneModel]:
-        """Parse GFF3 file and return list of gene models"""
+    def parse(gff3_path: Path, include_all_isoforms: bool = False) -> List[GeneModel]:
+        """Parse GFF3 file and return list of gene models.
+
+        Args:
+            gff3_path: Path to GFF3 file
+            include_all_isoforms: If True, include all isoforms as separate models.
+                                If False, use only the longest isoform per gene.
+
+        Returns:
+            List of GeneModel objects
+        """
         genes: Dict[str, GeneModel] = {}
         gene_to_mrna: Dict[str, List[str]] = defaultdict(list)
         mrna_to_cds: Dict[str, List[Tuple[int, int]]] = defaultdict(list)
         mrna_info: Dict[str, dict] = {}
-        
+
         with open(gff3_path) as f:
             for line in f:
                 if line.startswith('#') or not line.strip():
                     continue
-                
+
                 parts = line.strip().split('\t')
                 if len(parts) < 9:
                     continue
-                
+
                 seqid, source, feature, start, end, score, strand, phase, attributes = parts
                 start, end = int(start), int(end)
-                
+
                 # Parse attributes
                 attrs = {}
                 for attr in attributes.split(';'):
                     if '=' in attr:
                         key, value = attr.split('=', 1)
                         attrs[key] = value
-                
+
                 if feature == 'gene':
                     gene_id = attrs.get('ID', f'gene_{len(genes)}')
                     genes[gene_id] = GeneModel(
@@ -265,34 +274,54 @@ class GFF3Parser:
                         end=end,
                         strand=strand
                     )
-                
+
                 elif feature == 'mRNA' or feature == 'transcript':
                     mrna_id = attrs.get('ID', '')
                     parent = attrs.get('Parent', '')
                     if parent and mrna_id:
                         gene_to_mrna[parent].append(mrna_id)
                         mrna_info[mrna_id] = {'seqid': seqid, 'start': start, 'end': end, 'strand': strand}
-                
+
                 elif feature == 'CDS':
                     parent = attrs.get('Parent', '')
                     if parent:
                         # Handle multiple parents
                         for p in parent.split(','):
                             mrna_to_cds[p].append((start, end))
-        
-        # Assign CDS to genes (use first/longest mRNA)
-        for gene_id, gene in genes.items():
-            mrnas = gene_to_mrna.get(gene_id, [])
-            if mrnas:
-                # Find mRNA with most CDS
-                best_mrna = max(mrnas, key=lambda m: len(mrna_to_cds.get(m, [])))
-                cds_list = mrna_to_cds.get(best_mrna, [])
-                gene.cds_regions = sorted(cds_list, key=lambda x: x[0])
-        
-        # Filter genes with CDS
-        valid_genes = [g for g in genes.values() if g.cds_regions]
-        
-        return valid_genes
+
+        # Assign CDS to genes
+        if include_all_isoforms:
+            # Create separate gene models for each isoform
+            result_genes = []
+            for gene_id, gene in genes.items():
+                mrnas = gene_to_mrna.get(gene_id, [])
+                for i, mrna_id in enumerate(mrnas):
+                    cds_list = mrna_to_cds.get(mrna_id, [])
+                    if cds_list:  # Only include if has CDS
+                        # Create unique ID for isoform
+                        isoform_id = f"{gene_id}.{i+1}"
+                        isoform_gene = GeneModel(
+                            gene_id=isoform_id,
+                            seqid=gene.seqid,
+                            start=gene.start,
+                            end=gene.end,
+                            strand=gene.strand
+                        )
+                        isoform_gene.cds_regions = sorted(cds_list, key=lambda x: x[0])
+                        result_genes.append(isoform_gene)
+        else:
+            # Original behavior: use only longest isoform per gene
+            for gene_id, gene in genes.items():
+                mrnas = gene_to_mrna.get(gene_id, [])
+                if mrnas:
+                    # Find mRNA with most CDS
+                    best_mrna = max(mrnas, key=lambda m: len(mrna_to_cds.get(m, [])))
+                    cds_list = mrna_to_cds.get(best_mrna, [])
+                    gene.cds_regions = sorted(cds_list, key=lambda x: x[0])
+
+            result_genes = [g for g in genes.values() if g.cds_regions]
+
+        return result_genes
 
 
 class GenBankWriter:
@@ -469,7 +498,8 @@ class AugustusTrainer:
         use_memory: bool = False,
         optimize_method: int = 3,
         stop_after_first: bool = False,
-        start_codons: str = 'ATG'
+        start_codons: str = 'ATG',
+        include_all_isoforms: bool = False
     ):
         self.gff3_file = Path(gff3_file).resolve()
         self.genome_file = Path(genome_file).resolve()
@@ -487,6 +517,7 @@ class AugustusTrainer:
         self.optimize_method = optimize_method
         self.stop_after_first = stop_after_first
         self.start_codons = [c.strip().upper() for c in start_codons.split(',') if c.strip()]
+        self.include_all_isoforms = include_all_isoforms
         
         # Setup AUGUSTUS config path
         if augustus_config_path:
@@ -529,19 +560,21 @@ class AugustusTrainer:
         self.logger.info(f"Genome: {self.genome_file}")
         self.logger.info(f"Output: {self.output_dir}")
         
-        # Load genome
-        self.logger.info("Loading genome FASTA...")
+        # Load genome (lazy loading - index only)
+        self.logger.info("Indexing genome FASTA...")
         self.fasta_reader = FastaReader(self.genome_file)
-        self.logger.info(f"Loaded {len(self.fasta_reader.sequences)} sequences")
+        self.logger.info(f"Indexed {len(self.fasta_reader.index)} sequences")
         
         # Parse GFF3
         self.logger.info("Parsing GFF3 file...")
-        self.genes = GFF3Parser.parse(self.gff3_file)
+        if self.include_all_isoforms:
+            self.logger.info("Including all isoforms as separate models")
+        self.genes = GFF3Parser.parse(self.gff3_file, include_all_isoforms=self.include_all_isoforms)
         self.logger.info(f"Found {len(self.genes)} gene models with CDS")
-        
+
         if self.onlytrain_gff3:
             self.logger.info("Parsing onlytrain GFF3...")
-            self.onlytrain_genes = GFF3Parser.parse(self.onlytrain_gff3)
+            self.onlytrain_genes = GFF3Parser.parse(self.onlytrain_gff3, include_all_isoforms=self.include_all_isoforms)
             # Remove genes that are in main training set
             main_ids = {g.gene_id for g in self.genes}
             self.onlytrain_genes = [g for g in self.onlytrain_genes if g.gene_id not in main_ids]
@@ -1439,7 +1472,11 @@ Examples:
     parser.add_argument('--start-codons', default='ATG',
                         help='Comma-separated list of allowed start codons (e.g., "ATG,CTG,TTG"). '
                              'Probabilities will be distributed uniformly. (default: ATG)')
-    
+    parser.add_argument('--include-all-isoforms', action='store_true',
+                        help='Include all alternative splice isoforms as separate gene models '
+                             '(instead of using only the longest isoform per gene). '
+                             'This increases training data diversity but may improve predictions. (default: use longest only)')
+
     args = parser.parse_args()
     
     # Validate inputs
@@ -1469,7 +1506,8 @@ Examples:
         use_memory=args.use_memory,
         optimize_method=args.optimize_method,
         stop_after_first=args.stop_after_first,
-        start_codons=args.start_codons
+        start_codons=args.start_codons,
+        include_all_isoforms=args.include_all_isoforms
     )
     
     try:
