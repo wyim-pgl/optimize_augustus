@@ -116,6 +116,41 @@ except ImportError:
     print("Warning: BioPython not installed. Install with: pip install biopython", file=sys.stderr)
 
 
+# Globals for the ProcessPoolExecutor worker
+_worker_fasta_reader: Optional[FastaReader] = None
+_worker_gb_writer: Optional[GenBankWriter] = None
+
+
+def _initialize_gb_worker(fasta_path: Path, flanking_length: int):
+    """
+    Initializer for the GenBank conversion worker process.
+    Creates a single FastaReader and GenBankWriter instance per worker.
+    """
+    global _worker_fasta_reader, _worker_gb_writer
+    # Each worker process gets its own reader and writer instance
+    _worker_fasta_reader = FastaReader(fasta_path)
+    _worker_gb_writer = GenBankWriter(_worker_fasta_reader, flanking_length)
+
+
+def _run_gb_conversion(gene: GeneModel) -> Tuple[str, str]:
+    """
+    The actual worker function that converts a gene to GenBank format.
+    Relies on the globally initialized writer in each worker process.
+    """
+    global _worker_gb_writer
+    if _worker_gb_writer is None:
+        # This should not happen if the initializer is called correctly
+        return (gene.gene_id, "")
+    
+    try:
+        gb_string = _worker_gb_writer.gene_to_genbank(gene)
+        return (gene.gene_id, gb_string)
+    except Exception as e:
+        # Log the error and return an empty string
+        logging.error(f"Failed to convert gene {gene.gene_id} in worker: {e}")
+        return (gene.gene_id, "")
+
+
 class FastaReader:
     """FASTA file reader using BioPython"""
     
@@ -412,7 +447,8 @@ class AugustusTrainer:
         min_intron_len: int = 30,
         use_memory: bool = False,
         optimize_method: int = 3,
-        stop_after_first: bool = False
+        stop_after_first: bool = False,
+        start_codons: str = 'ATG'
     ):
         self.gff3_file = Path(gff3_file).resolve()
         self.genome_file = Path(genome_file).resolve()
@@ -429,6 +465,7 @@ class AugustusTrainer:
         self.use_memory = use_memory
         self.optimize_method = optimize_method
         self.stop_after_first = stop_after_first
+        self.start_codons = [c.strip().upper() for c in start_codons.split(',') if c.strip()]
         
         # Setup AUGUSTUS config path
         if augustus_config_path:
@@ -570,9 +607,9 @@ class AugustusTrainer:
         self._mark_ok('step1')
     
     def step2_convert_to_genbank(self):
-        """Step 2: Convert GFF3 to GenBank format"""
+        """Step 2: Convert GFF3 to GenBank format (in parallel)"""
         self.logger.info("\n" + "=" * 50)
-        self.logger.info("Step 2: Convert GFF3 to GenBank format")
+        self.logger.info("Step 2: Convert GFF3 to GenBank format (in parallel)")
         self.logger.info("=" * 50)
         
         if self._check_ok_file('step2'):
@@ -580,32 +617,47 @@ class AugustusTrainer:
             self._load_genbank_files()
             return
         
-        gb_writer = GenBankWriter(self.fasta_reader, self.flanking_length)
+        all_genes_to_process = self.genes + self.onlytrain_genes
+        total_genes = len(all_genes_to_process)
+        self.logger.info(f"Converting {total_genes} total genes to GenBank format using {self.cpu} workers...")
         
-        # Convert main genes
-        genes_gb = self.output_dir / 'genes.raw.gb'
-        self.logger.info(f"Converting {len(self.genes)} genes to GenBank format...")
-        gb_writer.write_genbank(self.genes, genes_gb)
-        
-        # Cache genbank content
-        for gene in self.genes:
-            try:
-                self.gb_content[gene.gene_id] = gb_writer.gene_to_genbank(gene)
-            except Exception as e:
-                self.logger.warning(f"Failed to cache gene {gene.gene_id}: {e}")
-        
-        # Convert onlytrain genes if provided
-        if self.onlytrain_genes:
-            onlytrain_gb = self.output_dir / 'genes.onlytrain.gb'
-            self.logger.info(f"Converting {len(self.onlytrain_genes)} onlytrain genes...")
-            gb_writer.write_genbank(self.onlytrain_genes, onlytrain_gb)
+        # Use a process pool to parallelize the conversion
+        with ProcessPoolExecutor(
+            max_workers=self.cpu,
+            initializer=_initialize_gb_worker,
+            initargs=(self.genome_file, self.flanking_length)
+        ) as executor:
             
-            for gene in self.onlytrain_genes:
-                try:
-                    self.gb_content[gene.gene_id] = gb_writer.gene_to_genbank(gene)
-                except Exception as e:
-                    self.logger.warning(f"Failed to cache onlytrain gene {gene.gene_id}: {e}")
+            futures = [executor.submit(_run_gb_conversion, gene) for gene in all_genes_to_process]
+            
+            processed_count = 0
+            for future in as_completed(futures):
+                gene_id, gb_string = future.result()
+                if gb_string:
+                    self.gb_content[gene_id] = gb_string
+                
+                processed_count += 1
+                if processed_count % 100 == 0 or processed_count == total_genes:
+                    self.logger.info(f"Converted {processed_count}/{total_genes} genes...")
+
+        self.logger.info("All genes converted. Writing to output files...")
         
+        # Write main genes file
+        genes_gb_path = self.output_dir / 'genes.raw.gb'
+        with open(genes_gb_path, 'w') as f:
+            for gene in self.genes:
+                if gene.gene_id in self.gb_content:
+                    f.write(self.gb_content[gene.gene_id])
+        
+        # Write onlytrain genes file if they exist
+        if self.onlytrain_genes:
+            onlytrain_gb_path = self.output_dir / 'genes.onlytrain.gb'
+            with open(onlytrain_gb_path, 'w') as f:
+                for gene in self.onlytrain_genes:
+                    if gene.gene_id in self.gb_content:
+                        f.write(self.gb_content[gene.gene_id])
+        
+        self.logger.info("GenBank files written.")
         self._mark_ok('step2')
     
     def _load_genbank_files(self):
@@ -958,7 +1010,7 @@ class AugustusTrainer:
         
         optimizer = AugustusOptimizer(
             species_name=self.species_name,
-            train_gb=str(train_file),
+            genes_for_cv_gb=str(train_file),
             augustus_config_path=str(self.config_path),
             onlytrain_gb=str(onlytrain_file) if onlytrain_file.exists() else None,
             cpu=self.cpu,
@@ -1027,8 +1079,8 @@ class AugustusTrainer:
         with open(self.output_dir / 'etraining.out2', 'w') as f:
             f.write(result.stdout)
         
-        # Fix exon_probs.pbl to only allow ATG start codon
-        self._fix_start_codons()
+        # Set start codons based on user input
+        self._set_start_codons()
         
         # Run augustus test
         test_file = self.output_dir / 'genes.gb.test'
@@ -1065,26 +1117,29 @@ class AugustusTrainer:
         self._mark_ok('step7')
         return metrics
     
-    def _fix_start_codons(self):
-        """Fix exon_probs.pbl to only allow ATG as start codon"""
-        exon_probs = self.config_path / 'species' / self.species_name / f'{self.species_name}_exon_probs.pbl'
+    def _set_start_codons(self):
+        """Set start codons in exon_probs.pbl based on user input."""
+        exon_probs_file = self.config_path / 'species' / self.species_name / f'{self.species_name}_exon_probs.pbl'
         
-        if not exon_probs.exists():
+        if not exon_probs_file.exists() or not self.start_codons:
+            self.logger.warning(f"Cannot set start codons: {exon_probs_file} not found or no codons specified.")
             return
         
-        with open(exon_probs) as f:
+        with open(exon_probs_file) as f:
             content = f.read()
         
-        # Replace start codon section
-        new_section = """[STARTCODONS]
-# number of start codons:
-1
-# start codons and their probabilities
-ATG\t1
-
-# Length distributions
-[LENGTH]"""
+        # Build the new STARTCODONS section
+        num_codons = len(self.start_codons)
+        prob = 1.0 / num_codons if num_codons > 0 else 0
         
+        new_section_lines = ["[STARTCODONS]", f"# number of start codons:\n{num_codons}", "# start codons and their probabilities"]
+        for codon in self.start_codons:
+            new_section_lines.append(f"{codon.upper()}\t{prob}")
+        
+        new_section = "\n".join(new_section_lines) + "\n\n# Length distributions\n[LENGTH]"
+        
+        # Replace the existing [STARTCODONS] section up to [LENGTH]
+        # The re.DOTALL flag allows '.' to match newlines
         content = re.sub(
             r'\[STARTCODONS\].*?\[LENGTH\]',
             new_section,
@@ -1092,10 +1147,10 @@ ATG\t1
             flags=re.DOTALL
         )
         
-        with open(exon_probs, 'w') as f:
+        with open(exon_probs_file, 'w') as f:
             f.write(content)
         
-        self.logger.info("Fixed start codons to only allow ATG")
+        self.logger.info(f"Set start codons to: {', '.join(self.start_codons)} with uniform probability.")
     
     def step8_compare_and_finalize(self, first_metrics: AccuracyMetrics, second_metrics: AccuracyMetrics):
         """Step 8: Compare results and finalize"""
@@ -1249,6 +1304,9 @@ Examples:
                         help='0=none, 1=Bayesian, 2=optimize_augustus.pl, 3=both (default: 1)')
     parser.add_argument('--stop-after-first', action='store_true',
                         help='Stop after first etraining (skip optimization)')
+    parser.add_argument('--start-codons', default='ATG',
+                        help='Comma-separated list of allowed start codons (e.g., "ATG,CTG,TTG"). '
+                             'Probabilities will be distributed uniformly. (default: ATG)')
     
     args = parser.parse_args()
     
@@ -1278,7 +1336,8 @@ Examples:
         min_intron_len=args.min_intron_len,
         use_memory=args.use_memory,
         optimize_method=args.optimize_method,
-        stop_after_first=args.stop_after_first
+        stop_after_first=args.stop_after_first,
+        start_codons=args.start_codons
     )
     
     try:

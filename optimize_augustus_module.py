@@ -67,7 +67,7 @@ class AccuracyMetrics:
         ) / 15
 
 
-def run_single_evaluation(args: Tuple) -> AccuracyMetrics:
+def run_single_evaluation(args: Tuple) -> Tuple[AccuracyMetrics, Optional[str]]:
     """Worker function for parallel evaluation (must be at module level for pickling)"""
     test_content, train_content, config_dir, work_dir, species_name, min_intron_len = args
     
@@ -84,38 +84,36 @@ def run_single_evaluation(args: Tuple) -> AccuracyMetrics:
     
     # Run etraining
     try:
-        subprocess.run(
-            [
-                'etraining',
-                f'--min_intron_len={min_intron_len}',
-                f'--species={species_name}',
-                f'--AUGUSTUS_CONFIG_PATH={config_dir}',
-                str(train_file)
-            ],
-            capture_output=True,
-            check=True,
-            timeout=300
-        )
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return AccuracyMetrics()
+        etraining_cmd = [
+            'etraining',
+            f'--min_intron_len={min_intron_len}',
+            f'--species={species_name}',
+            f'--AUGUSTUS_CONFIG_PATH={config_dir}',
+            str(train_file)
+        ]
+        subprocess.run(etraining_cmd, capture_output=True, check=True, text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return AccuracyMetrics(), f"Timeout during etraining on {work_dir}"
+    except subprocess.CalledProcessError as e:
+        err_msg = f"Etraining failed in {work_dir}. Stderr: {e.stderr[:500]}"
+        return AccuracyMetrics(), err_msg
     
     # Run augustus
     try:
-        result = subprocess.run(
-            [
-                'augustus',
-                f'--min_intron_len={min_intron_len}',
-                f'--species={species_name}',
-                f'--AUGUSTUS_CONFIG_PATH={config_dir}',
-                str(test_file)
-            ],
-            capture_output=True,
-            check=True,
-            timeout=600
-        )
-        output = result.stdout.decode()
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError):
-        return AccuracyMetrics()
+        augustus_cmd = [
+            'augustus',
+            f'--min_intron_len={min_intron_len}',
+            f'--species={species_name}',
+            f'--AUGUSTUS_CONFIG_PATH={config_dir}',
+            str(test_file)
+        ]
+        result = subprocess.run(augustus_cmd, capture_output=True, check=True, text=True, timeout=600)
+        output = result.stdout
+    except subprocess.TimeoutExpired:
+        return AccuracyMetrics(), f"Timeout during augustus prediction on {work_dir}"
+    except subprocess.CalledProcessError as e:
+        err_msg = f"Augustus prediction failed in {work_dir}. Stderr: {e.stdout[:500]}"
+        return AccuracyMetrics(), err_msg
     
     # Parse accuracy
     metrics = AccuracyMetrics()
@@ -128,21 +126,23 @@ def run_single_evaluation(args: Tuple) -> AccuracyMetrics:
         
         exon_match = re.search(r'exon level[\s|]+([\d.]+)[\s|]+([\d.]+)[\s|]+([\d.]+)', line)
         if exon_match:
-            pred, annot, tp = map(float, exon_match.groups())
-            if annot > 0:
-                metrics.exon_sensitivity = tp / annot
-            if pred > 0:
-                metrics.exon_specificity = tp / pred
+            # This part of the output is "predicted, annotated, TP"
+            pred_ex, annot_ex, tp_ex = map(float, exon_match.groups())
+            if annot_ex > 0:
+                metrics.exon_sensitivity = tp_ex / annot_ex
+            if pred_ex > 0:
+                metrics.exon_specificity = tp_ex / pred_ex
         
         gene_match = re.search(r'gene level[\s|]+([\d.]+)[\s|]+([\d.]+)[\s|]+([\d.]+)', line)
         if gene_match:
-            pred, annot, tp = map(float, gene_match.groups())
-            if annot > 0:
-                metrics.gene_sensitivity = tp / annot
-            if pred > 0:
-                metrics.gene_specificity = tp / pred
+            # This part of the output is "predicted, annotated, TP"
+            pred_g, annot_g, tp_g = map(float, gene_match.groups())
+            if annot_g > 0:
+                metrics.gene_sensitivity = tp_g / annot_g
+            if pred_g > 0:
+                metrics.gene_specificity = tp_g / pred_g
     
-    return metrics
+    return metrics, None
 
 
 class AugustusOptimizer:
@@ -181,7 +181,7 @@ class AugustusOptimizer:
     def __init__(
         self,
         species_name: str,
-        train_gb: str,
+        genes_for_cv_gb: str,
         augustus_config_path: Optional[str] = None,
         onlytrain_gb: Optional[str] = None,
         cpu: int = 8,
@@ -195,7 +195,7 @@ class AugustusOptimizer:
         output_dir: str = "optimize_output"
     ):
         self.species_name = species_name
-        self.train_gb = Path(train_gb).resolve()
+        self.genes_for_cv_gb = Path(genes_for_cv_gb).resolve()
         self.onlytrain_gb = Path(onlytrain_gb).resolve() if onlytrain_gb else None
         self.cpu = cpu
         self.n_trials = n_trials
@@ -253,7 +253,7 @@ class AugustusOptimizer:
         # Load gene models
         self._load_gene_models()
         
-        logger.info(f"Optimizer setup: {len(self.test_genes)} test, {len(self.train_genes)} train genes")
+        logger.info(f"Optimizer setup: {len(self.test_genes)} test, {len(self.train_genes)} train genes for CV")
     
     def _load_param_ranges(self):
         """Load parameter ranges from metapars.cfg or use defaults"""
@@ -290,12 +290,14 @@ class AugustusOptimizer:
     
     def _load_gene_models(self):
         """Load gene models from GenBank files"""
-        all_genes = self._parse_genbank(self.train_gb)
+        # This dataset is used for cross-validation (CV) within the optimizer.
+        # It's split into its own training and testing sets.
+        all_genes = self._parse_genbank(self.genes_for_cv_gb)
         
         if self.onlytrain_gb and self.onlytrain_gb.exists():
             self.onlytrain_genes = self._parse_genbank(self.onlytrain_gb)
         
-        # Split into test/train
+        # Split into test/train for cross-validation
         n_genes = len(all_genes)
         n_test = int(n_genes * self.test_ratio)
         n_test = max(min(n_test, self.max_test_genes), min(n_genes, self.min_test_genes))
@@ -443,11 +445,13 @@ class AugustusOptimizer:
                 futures = [executor.submit(run_single_evaluation, args) for args in eval_args]
                 for future in as_completed(futures):
                     try:
-                        metrics = future.result(timeout=900)
+                        metrics, error_str = future.result(timeout=900)
+                        if error_str:
+                            logger.warning(f"A batch failed during optimization: {error_str}")
                         if metrics.weighted_accuracy > 0:
                             all_metrics.append(metrics)
                     except Exception as e:
-                        logger.debug(f"Batch failed: {e}")
+                        logger.warning(f"Batch evaluation future failed: {e}", exc_info=True)
             
             if not all_metrics:
                 return 0.0

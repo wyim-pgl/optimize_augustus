@@ -24,6 +24,33 @@ which augustus etraining
 echo $AUGUSTUS_CONFIG_PATH
 ```
 
+### Installing AUGUSTUS
+
+Pick one of the following approaches and then set `AUGUSTUS_CONFIG_PATH` to the `config/` directory inside the AUGUSTUS source tree (or `/usr/share/augustus/config` for packaged installs).
+
+#### Ubuntu/Debian package
+```bash
+sudo apt-get update
+sudo apt-get install -y augustus
+export AUGUSTUS_CONFIG_PATH=/usr/share/augustus/config
+```
+
+#### Conda (Bioconda)
+```bash
+conda create -n augustus -c bioconda -c conda-forge augustus
+conda activate augustus
+export AUGUSTUS_CONFIG_PATH=$CONDA_PREFIX/config
+```
+
+#### Build from source
+```bash
+git clone https://github.com/Gaius-Augustus/Augustus.git
+cd Augustus
+make
+export PATH="$PWD/bin:$PATH"
+export AUGUSTUS_CONFIG_PATH="$PWD/config"
+```
+
 ## Files
 
 - `augustus_training.py` - Main pipeline (replaces BGM2AT)
