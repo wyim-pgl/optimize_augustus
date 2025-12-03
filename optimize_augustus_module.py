@@ -25,6 +25,11 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime
 
+# Pre-compile regex patterns for performance
+_RE_NUC_LEVEL = re.compile(r'nucleotide level[\s|]+([\d.]+)[\s|]+([\d.]+)')
+_RE_EXON_LEVEL = re.compile(r'exon level[\s|]+([\d.]+)[\s|]+([\d.]+)[\s|]+([\d.]+)')
+_RE_GENE_LEVEL = re.compile(r'gene level[\s|]+([\d.]+)[\s|]+([\d.]+)[\s|]+([\d.]+)')
+
 try:
     import optuna
     from optuna.samplers import TPESampler
@@ -115,16 +120,16 @@ def run_single_evaluation(args: Tuple) -> Tuple[AccuracyMetrics, Optional[str]]:
         err_msg = f"Augustus prediction failed in {work_dir}. Stderr: {e.stdout[:500]}"
         return AccuracyMetrics(), err_msg
     
-    # Parse accuracy
+    # Parse accuracy (using pre-compiled regex patterns)
     metrics = AccuracyMetrics()
-    
+
     for line in output.split('\n'):
-        nuc_match = re.search(r'nucleotide level[\s|]+([\d.]+)[\s|]+([\d.]+)', line)
+        nuc_match = _RE_NUC_LEVEL.search(line)
         if nuc_match:
             metrics.nucleotide_sensitivity = float(nuc_match.group(1))
             metrics.nucleotide_specificity = float(nuc_match.group(2))
-        
-        exon_match = re.search(r'exon level[\s|]+([\d.]+)[\s|]+([\d.]+)[\s|]+([\d.]+)', line)
+
+        exon_match = _RE_EXON_LEVEL.search(line)
         if exon_match:
             # This part of the output is "predicted, annotated, TP"
             pred_ex, annot_ex, tp_ex = map(float, exon_match.groups())
@@ -132,8 +137,8 @@ def run_single_evaluation(args: Tuple) -> Tuple[AccuracyMetrics, Optional[str]]:
                 metrics.exon_sensitivity = tp_ex / annot_ex
             if pred_ex > 0:
                 metrics.exon_specificity = tp_ex / pred_ex
-        
-        gene_match = re.search(r'gene level[\s|]+([\d.]+)[\s|]+([\d.]+)[\s|]+([\d.]+)', line)
+
+        gene_match = _RE_GENE_LEVEL.search(line)
         if gene_match:
             # This part of the output is "predicted, annotated, TP"
             pred_g, annot_g, tp_g = map(float, gene_match.groups())
@@ -141,7 +146,7 @@ def run_single_evaluation(args: Tuple) -> Tuple[AccuracyMetrics, Optional[str]]:
                 metrics.gene_sensitivity = tp_g / annot_g
             if pred_g > 0:
                 metrics.gene_specificity = tp_g / pred_g
-    
+
     return metrics, None
 
 
@@ -377,14 +382,15 @@ class AugustusOptimizer:
         # Create modified parameters.cfg
         with open(self.params_file) as f:
             params_content = f.read()
-        
+
         for param_name, value in params.items():
-            pattern = rf'({re.escape(param_name)}\s+)\S+'
+            # Compile pattern for this parameter
+            pattern = re.compile(rf'({re.escape(param_name)}\s+)\S+')
             if isinstance(value, float):
                 replacement = rf'\g<1>{value:.6f}'
             else:
                 replacement = rf'\g<1>{value}'
-            params_content = re.sub(pattern, replacement, params_content)
+            params_content = pattern.sub(replacement, params_content)
         
         modified_params = species_subdir / f'{self.species_name}_parameters.cfg'
         with open(modified_params, 'w') as f:
@@ -416,17 +422,23 @@ class AugustusOptimizer:
             
             # Prepare evaluation args
             eval_args = []
+
+            # Pre-compute train_genes content once (optimization: avoid repeated joins)
+            train_genes_content = ''.join(g.content for g in self.train_genes)
+            onlytrain_content = ''.join(g.content for g in self.onlytrain_genes)
+
+            # Pre-compute batch contents
+            batch_contents = [''.join(g.content for g in batch) for batch in batches]
+
             for i, test_batch in enumerate(batches):
                 # Test content
-                test_content = ''.join(g.content for g in test_batch)
-                
+                test_content = batch_contents[i]
+
                 # Train content (everything except this batch)
-                train_content = ''.join(g.content for g in self.train_genes)
-                for j, other_batch in enumerate(batches):
-                    if j != i:
-                        train_content += ''.join(g.content for g in other_batch)
-                train_content += ''.join(g.content for g in self.onlytrain_genes)
-                
+                # Combine: train_genes + all batches except current + onlytrain_genes
+                other_batches_content = ''.join(batch_contents[j] for j in range(len(batches)) if j != i)
+                train_content = train_genes_content + other_batches_content + onlytrain_content
+
                 work_dir = eval_dir / f'batch_{i}'
                 eval_args.append((
                     test_content,
@@ -497,14 +509,16 @@ class AugustusOptimizer:
     def _grid_search(self) -> Dict[str, float]:
         """Fallback grid search"""
         logger.info("Running grid search (fallback)")
-        
+
         # Start with current values
         best_params = {}
         with open(self.params_file) as f:
             content = f.read()
-        
+
         for param_name, (ptype, low, high) in self.param_ranges.items():
-            match = re.search(rf'{re.escape(param_name)}\s+(\S+)', content)
+            # Compile pattern for this parameter
+            pattern = re.compile(rf'{re.escape(param_name)}\s+(\S+)')
+            match = pattern.search(content)
             if match:
                 try:
                     if ptype == 'float':
@@ -553,21 +567,22 @@ class AugustusOptimizer:
         """Apply best params to config file"""
         if not self.best_params:
             return
-        
+
         with open(self.params_file) as f:
             content = f.read()
-        
+
         for param_name, value in self.best_params.items():
-            pattern = rf'({re.escape(param_name)}\s+)\S+'
+            # Compile pattern for this parameter
+            pattern = re.compile(rf'({re.escape(param_name)}\s+)\S+')
             if isinstance(value, float):
                 replacement = rf'\g<1>{value:.6f}'
             else:
                 replacement = rf'\g<1>{value}'
-            content = re.sub(pattern, replacement, content)
-        
+            content = pattern.sub(replacement, content)
+
         with open(self.params_file, 'w') as f:
             f.write(content)
-        
+
         logger.info(f"Applied best parameters to {self.params_file}")
     
     def cleanup(self):
